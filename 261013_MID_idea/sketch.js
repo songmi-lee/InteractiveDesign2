@@ -11,11 +11,12 @@ const DEG = Math.PI / 180;
 const DW = 700,
   DH = 440; // design-space size
 const COL = {
-  bg: "#1F1F1F",
-  person: "#DCDCDC",
+  bg: "#47B8E0",
+  sky: "#fff5e6",
+  person: "#DCDCDC", // 새의 몸통색 (이미지 로딩 실패 시 대체 사람 그림에도 쓰임)
   dock: "#6B6B6B",
   rod: "#404040",
-  line: "#EDEDED",
+  line: "#a5a5a5",
   water: "#47B8E0",
   bird: "#9A9A9A",
 };
@@ -28,7 +29,10 @@ const FISH_PALETTE = [
   "#3B4FD8",
 ];
 
-const WATER_Y = 272; // mean water surface
+const DOCK_Y = 272; // top surface of the dock (where things sit)
+// Mean water surface. The waves rise 8.5 units and the line is 6 thick (+3), so the highest edge of the water
+// is WATER_Y - 11.5. Using DOCK_Y + 12 keeps that highest point at or below the dock's top surface.
+const WATER_Y = DOCK_Y + 12;
 const UW = { l: 24, r: 682, top: 308, bottom: 428 }; // underwater swimming area
 
 // Person / rod geometry (design units)
@@ -38,6 +42,28 @@ const ARM_LEN = Math.hypot(HAND_REST.x - SHOULDER.x, HAND_REST.y - SHOULDER.y);
 const PHI0 = Math.atan2(HAND_REST.y - SHOULDER.y, HAND_REST.x - SHOULDER.x);
 const ROD_LEN = 200,
   ROD_ANG = -29 * DEG; // the rod keeps one fixed pose
+// Fisher illustration: assets/fisher_body_v2.png (static: head, torso, upper arm, legs, stool, dock) and
+// assets/fisher_arm_v2.png (forearm + both gloves + reel + rod, ONE rigid piece). Both pictures share one pixel space
+// ("full" space). ANCHOR is the dock's top-right corner in that space and lands on (DOCK_RIGHT, DOCK_Y) in the scene.
+// SCALE resizes the whole fisher; ELBOW is the single rotation axis; GRIP is where the front hand holds the rod;
+// TIP is the rod tip at rest (the fishing line starts there). Poses are rotation angles about ELBOW (negative = hand up).
+const FISHER = {
+  SCALE: 0.22,
+  ANCHOR: { x: 1100, y: 1155 },
+  DOCK_RIGHT: 277,
+  ELBOW: { x: 695, y: 715 },
+  GRIP: { x: 857, y: 617 },
+  TIP: { x: 1305, y: 22 },
+  BODY: { file: "assets/fisher_body_v2.png", x: 0, y: 415 }, // top-left of each cropped picture in full space
+  ARM: { file: "assets/fisher_arm_v2.png", x: 677, y: 17 },
+  POSE: { idle: 0, catch: -7 * DEG, feed: -16 * DEG },
+  MOVE_S: 0.22, // length of a pose change (seconds); afterwards the pose is locked
+  img: null,
+  armImg: null,
+  ok: false,
+  failed: false, // 사진을 못 불러왔을 때만 true (그때만 코드로 그린 사람을 보여줌)
+  COLOR: { dock: "#8B5E3C", stool: "#B07850" }, // null = 원래 크림색. 예: "#8B5E3C"
+};
 const LEN_MIN = 40,
   LEN_MAX = 378; // fishing-line length range (drag the rod up/down)
 const STORE_KEY = "fishingMemo.v1",
@@ -52,8 +78,100 @@ const BUCKET = {
   mouthY: 222,
   zone: { x: 24, y: 180, w: 84, h: 100 },
 };
+// Dashed drop-zone frame around the bucket. It is centred on the bucket (BUCKET.mouthX), so left/right are symmetric.
+// halfW = half the frame width; padTop = gap above the "n/10" label; padBottom = how far below the bucket base it reaches.
+const ZONE_STYLE = { halfW: 34, padTop: 12, padBottom: 6 };
+// ---- Seasons + fish pictures ---------------------------------------------------------------------------
+// A memo keeps TWO separate facts: createdAt (real device time, never changed) and season (which picture the fish
+// uses; normally seasonOf(createdAt), but the calendar preview can pick another one).
+const SEASONS = ["spring", "summer", "autumn", "winter"];
+const SEASON_LABEL = {
+  spring: "봄",
+  summer: "여름",
+  autumn: "가을",
+  winter: "겨울",
+};
+// Dev switch: set e.g. 'winter' to force the fish picture of every NEW memo (createdAt is still the real time).
+// The same can be done without editing code by opening the page with ?season=winter at the end of the URL.
+const DEV_SEASON = null;
+// One picture per season (replace the files to change the design). Any key of FISH_IMG_DEFAULT may be added to a season's
+// entry to override it for that season only, e.g. summer: { file: '...', width: 1.2 }.
+// Per-season values (width / textX / textY / textA / textB) were measured on each picture: 봄 병어, 여름 민어, 가을 전어, 겨울 아귀.
+const FISH_IMG = {
+  spring: {
+    file: "assets/fish-spring.png",
+    mouthU: 0.0105,
+    mouthV: 0.529,
+    width: 0.85,
+    textX: 0.095,
+    textY: 0,
+    textA: 0.266,
+    textB: 0.116,
+  },
+  summer: {
+    file: "assets/fish-summer.png",
+    mouthU: 0.0094,
+    mouthV: 0.584,
+    width: 1.0,
+    textX: 0.089,
+    textY: 0.01,
+    textA: 0.307,
+    textB: 0.134,
+  },
+  autumn: {
+    file: "assets/fish-autumn.png",
+    mouthU: 0.0107,
+    mouthV: 0.574,
+    width: 1.0,
+    textX: 0.1,
+    textY: 0.028,
+    textA: 0.286,
+    textB: 0.124,
+  },
+  winter: {
+    file: "assets/fish-winter.png",
+    mouthU: 0.0089,
+    mouthV: 0.541,
+    width: 1.05,
+    textX: 0.154,
+    textY: 0.058,
+    textA: 0.269,
+    textB: 0.108,
+  },
+};
+// Size / position of the picture (relative to the fish length `size`, the point the fish moves / is caught by).
+const FISH_IMG_DEFAULT = {
+  width: 1.0, // picture width = size * width (height keeps the picture's own ratio)
+  anchorX: 0.5,
+  anchorY: 0.5, // which point of the picture (0..1) sits on the fish centre
+  offsetX: 0,
+  offsetY: 0, // extra shift, in units of `size`
+  mouthU: 0.01,
+  mouthV: 0.55, // 입 끝 위치(그림 왼쪽/위에서 0~1): 이 점이 바늘에 걸림
+  facesRight: false, // false: the pictures are drawn with the head on the left (all four are)
+  textX: 0.075,
+  textY: 0.005, // where the memo text is centred while caught (units of `size`)
+  textA: 0.27,
+  textB: 0.12, // half width / half height of the text area (units of `size`)
+};
+const BUCKET_LABEL_FS = 11; // font size of the "n/10" label (design units; scales with the bucket)
 const RIM_W = BUCKET.w + 4; // displayed width of the bucket rim (pictures are scaled to this)
 const WATER_X0 = 277; // where the dock ends and the water begins
+const WATER_X1 = 686; // right end of the water line (drawWater); the input box lines up with it
+const RESET_MARGIN = 16; // reset button: distance from the browser window's right / bottom edge
+// Dashed vertical guide (dock | water boundary) shown only while the bucket is being dragged.
+// dash = [dash length, gap length] in design units.
+const GUIDE_LINE = { color: "#888888", weight: 1.5, dash: [5, 5] };
+// Two-line hint above the n/10 label while the memo list is open.
+const BUCKET_NOTE = [
+  "데크 위에서 흔들기: 메모 삭제",
+  "물 위에서 흔들기: 메모 방생",
+];
+// "Bucket is full" toast: drawn on a dark plate in the memo-text area (position: toastAnchor()).
+// Distance (design units) from the water's mean surface up to the bottom of the pour / release message.
+// The waves rise ~11 units, so 16 leaves a visible gap above the crests.
+const TOAST_WATER_GAP = 16;
+const TOAST_STYLE = { size: 16, pad: 12, maxW: 340 };
 // Bucket pictures by number of bookmarks. 0–2 memos keep using the drawn bucket (no picture yet).
 const BUCKET_IMG = {
   mid: { file: "assets/bucket_mid.png" }, // 3–5 memos
@@ -89,6 +207,10 @@ let bucket = {
   rot: 0,
   vrot: 0,
 }; // current pose; pivot = bottom centre
+let preview = { on: false, season: "spring" }; // calendar preview mode (one-shot)
+let seasonBtn, seasonPop;
+let titleEl; // the title above the memo box
+let bucketAway = false; // true after a drag was released away from the dock: the clang plays once when it is home again
 let bucketPress = null; // press on the bucket: click (toggle list) or drag (move / shake)
 let bucketPour = null; // running "empty the bucket" animation
 let dumped = []; // fish spilled on the dock (visual only; their memos are already deleted)
@@ -124,14 +246,21 @@ function setup() {
   textFont("sans-serif");
   setupInput();
   buildResetUI();
+  buildSoundUI(); // sound on/off button (audio itself starts at the first click / key)
+  buildSeasonUI();
   computeLayout();
   placeInput();
   loadState(); // restore memos + bucket from localStorage
   loadBucketImages(); // async; a failed load keeps the drawn bucket
+  loadFishImages(); // async; a missing picture keeps the drawn fish
+  loadFisherImages(); // async; missing pictures keep the drawn person + rod
   const t = rodTip();
   hook.x = t.x;
   hook.y = t.y + rod.len;
   window.addEventListener("pagehide", saveState);
+  window.addEventListener("contextmenu", (ev) => {
+    if (ev.target && ev.target.tagName === "CANVAS") ev.preventDefault();
+  }); // no long-press menu on the canvas
 }
 
 function windowResized() {
@@ -141,44 +270,91 @@ function windowResized() {
   panelCache = {};
 }
 
+// The whole scene (everything except the text box, calendar and reset button) sits this many design units lower,
+// so the rod tip can rise above the dock without covering the text box. Change this one number to move it.
+const SCENE_DROP = 24;
+
+// 제목 (메모 입력창 바로 위, 왼쪽 정렬). 글꼴 / 크기 / 색 / 굵기는 여기서 바꾸세요.
+//  font: CSS font-family. 예) '"Georgia", serif'  '"Playfair Display", serif'  '"Pretendard", sans-serif'
+//        (Google Fonts 같은 웹폰트는 index.html <head>에 <link>를 먼저 넣어야 보여요)
+//  size: 한 줄의 글자 크기(px)   weight: 400(보통) ~ 900(가장 굵게)   lineHeight: 줄 간격 배수
+//  gap: 제목과 입력창 사이 간격(px)   color: 글자색
+const TITLE = {
+  lines: ["Fishful", "Thinking"],
+  font: '"Georgia", "Times New Roman", serif',
+  size: 34,
+  weight: 800,
+  color: "#1f416c",
+  lineHeight: 1.05,
+  gap: 8,
+};
+function titleH() {
+  return TITLE.lines.length * TITLE.size * TITLE.lineHeight; // height of the title text block (px)
+}
+
 function computeLayout() {
   L.narrow = width < 760 || width / height < 1.1;
   if (L.narrow) {
     // Phone/portrait: input on top, scene below it, memo text under the scene.
-    L.u = Math.max(0.3, Math.min(width / DW, (height * 0.62 - 66) / DH));
+    L.u = Math.max(
+      0.3,
+      Math.min(
+        width / DW,
+        (height * 0.62 - 66 - titleH() - TITLE.gap) / (DH + SCENE_DROP),
+      ),
+    );
     L.ox = (width - DW * L.u) / 2;
-    L.oy = 58;
+    L.oy = 58 + titleH() + TITLE.gap + SCENE_DROP * L.u; // (the title sits above the input, so everything moves down by its height)
     L.sceneH = L.oy + DH * L.u + 8;
     L.panel = {
       x: 20,
       y: L.sceneH + 6,
       w: width - 40,
-      h: Math.max(60, height - L.sceneH - 52),
+      h: Math.max(60, height - L.sceneH - 64),
     };
-    L.btn = { x: width - 12 - 76, y: 10, w: 76, h: 38 };
-    L.input = { x: 12, y: 10, w: width - 24 - 76 - 8, h: 38 };
+    L.btn = {
+      x: width - RESET_MARGIN - 76,
+      y: height - RESET_MARGIN - 38,
+      w: 76,
+      h: 38,
+    };
+    L.input = {
+      x: 12,
+      y: 10 + titleH() + TITLE.gap,
+      w: width - 24 - 76 - 8,
+      h: 38,
+    };
   } else {
     // Wide: scene on the left ~64%, memo text in the empty space on the right.
     L.sceneW = width * 0.64;
-    L.u = Math.min(L.sceneW / DW, height / DH);
+    L.u = Math.min(L.sceneW / DW, height / (DH + SCENE_DROP));
     L.ox = (L.sceneW - DW * L.u) / 2;
-    L.oy = (height - DH * L.u) / 2;
+    const oy0 = (height - (DH + SCENE_DROP) * L.u) / 2; // top of the (taller) layout box; the text box stays here
+    L.oy = oy0 + SCENE_DROP * L.u;
     L.panel = {
       x: L.sceneW + 10,
       y: height * 0.14,
       w: Math.max(80, width - L.sceneW - 50),
       h: height * 0.64,
     };
-    const ih = Math.max(30, 30 * L.u),
-      bw = Math.max(64, 56 * L.u),
-      iw = Math.max(120, 250 * L.u - bw - 8);
+    // Input: same left edge as before (design x 435), right edge = right end of the water line
+    // (WATER_X1 plus half of the 6-unit round-capped stroke), converted with the current scale/offset.
+    const ih = Math.max(30, 30 * L.u);
+    const right = L.ox + (WATER_X1 + 3) * L.u;
+    const iw = Math.max(120, right - (L.ox + 435 * L.u));
+    // the title needs room above the input: if the window is too short, the input moves down by just enough
     L.input = {
-      x: L.ox + 685 * L.u - bw - 8 - iw,
-      y: L.oy + 10 * L.u,
+      x: right - iw,
+      y: Math.max(oy0 + 10 * L.u, titleH() + TITLE.gap + 10),
       w: iw,
       h: ih,
     };
-    L.btn = { x: L.ox + 685 * L.u - bw, y: L.input.y, w: bw, h: ih }; // reset button right next to the input
+    L.btn = {
+      x: width - RESET_MARGIN - 76,
+      y: height - RESET_MARGIN - 38,
+      w: 76,
+      h: 38,
+    }; // bottom-right of the window
   }
 }
 
@@ -196,7 +372,7 @@ function setupInput() {
     boxSizing: "border-box",
     padding: "0 14px",
     background: "transparent",
-    color: "#F4F4F4",
+    color: "#000000",
     border: "1.5px solid #DCDCDC",
     borderRadius: "0",
     outline: "none",
@@ -204,6 +380,20 @@ function setupInput() {
     zIndex: "10",
     display: "block",
   });
+  titleEl = document.createElement("div");
+  titleEl.id = "page-title";
+  titleEl.textContent = TITLE.lines.join("\n");
+  Object.assign(titleEl.style, {
+    position: "fixed",
+    whiteSpace: "pre",
+    textAlign: "left",
+    pointerEvents: "none",
+    userSelect: "none",
+    margin: "0",
+    padding: "0",
+    zIndex: "9",
+  });
+  document.body.appendChild(titleEl);
   inputEl.maxLength = 200;
   inputEl.placeholder = "Write a thought, press Enter";
   inputEl.autocomplete = "off";
@@ -211,7 +401,7 @@ function setupInput() {
     const st = document.createElement("style");
     st.id = "memo-input-style";
     st.textContent =
-      "#memo-input::placeholder{color:#6E6E6E}#memo-input:focus{border-color:#fff!important}";
+      "#memo-input::placeholder{color:#AFAFAF}#memo-input:focus{border-color:#AFAFAF!important}";
     document.head.appendChild(st);
   }
   // Enter submits. IME-safe (Korean): if Enter arrives mid-composition we wait for
@@ -238,6 +428,78 @@ function setupInput() {
   });
 }
 
+// Calendar icon + season picker (plain HTML elements, so mouse and touch both work and the canvas never sees these clicks).
+function buildSeasonUI() {
+  const st = document.createElement("style");
+  st.textContent =
+    "#season-btn,#season-pop button{-webkit-tap-highlight-color:transparent}" +
+    "#season-btn{position:fixed;box-sizing:border-box;display:flex;align-items:center;justify-content:center;padding:0;background:transparent;color:#DCDCDC;border:1.5px solid #DCDCDC;border-radius:0;cursor:pointer;z-index:10}" +
+    "#season-btn svg{width:62%;height:62%}" +
+    "#season-btn.on{color:#47B8E0;border-color:#47B8E0}" +
+    "#season-pop{position:fixed;box-sizing:border-box;width:64px;display:none;flex-direction:column;gap:4px;padding:6px;background:#1F1F1F;border:1.5px solid #47B8E0;font-family:sans-serif;z-index:10}" +
+    "#season-pop .hd{color:#47B8E0;font-size:12px;line-height:1.2;text-align:center;padding-bottom:2px;white-space:nowrap}" +
+    "#season-pop button{font:inherit;font-size:14px;height:30px;padding:0;border:1.5px solid #6B6B6B;border-radius:0;background:transparent;color:#DCDCDC;cursor:pointer}" +
+    "#season-pop button.sel{background:#DCDCDC;color:#1F1F1F;border-color:#DCDCDC}";
+  document.head.appendChild(st);
+
+  seasonBtn = document.createElement("button");
+  seasonBtn.id = "season-btn";
+  seasonBtn.type = "button";
+  seasonBtn.setAttribute("aria-label", "계절 미리보기");
+  seasonBtn.title = "계절 미리보기";
+  seasonBtn.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">' +
+    '<rect x="3" y="5" width="18" height="16" rx="1.5"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/></svg>';
+  document.body.appendChild(seasonBtn);
+
+  seasonPop = document.createElement("div");
+  seasonPop.id = "season-pop";
+  seasonPop.innerHTML =
+    '<div class="hd">(미리보기)</div>' +
+    SEASONS.map(
+      (k) =>
+        '<button type="button" data-season="' +
+        k +
+        '">' +
+        SEASON_LABEL[k] +
+        "</button>",
+    ).join("");
+  document.body.appendChild(seasonPop);
+
+  seasonBtn.addEventListener("click", () => setPreview(!preview.on)); // icon again = cancel
+  seasonPop.addEventListener("click", (ev) => {
+    const k =
+      ev.target &&
+      ev.target.getAttribute &&
+      ev.target.getAttribute("data-season");
+    if (!SEASONS.includes(k)) return;
+    preview.season = k;
+    updateSeasonUI();
+    if (inputEl) inputEl.focus(); // go on typing the memo
+  });
+  updateSeasonUI();
+}
+
+function setPreview(on) {
+  preview.on = !!on;
+  if (preview.on) preview.season = seasonOf(Date.now()); // start on the current season
+  updateSeasonUI();
+}
+function updateSeasonUI() {
+  if (!seasonBtn) return;
+  seasonBtn.classList.toggle("on", preview.on);
+  seasonBtn.setAttribute("aria-pressed", preview.on ? "true" : "false");
+  seasonPop.style.display = preview.on ? "flex" : "none";
+  seasonPop
+    .querySelectorAll("button")
+    .forEach((bt) =>
+      bt.classList.toggle(
+        "sel",
+        bt.getAttribute("data-season") === preview.season,
+      ),
+    );
+}
+
 function placeInput() {
   const r = L.input,
     s = inputEl.style;
@@ -245,15 +507,53 @@ function placeInput() {
   s.top = r.y + "px";
   s.width = r.w + "px";
   s.height = r.h + "px";
-  s.fontSize = Math.max(14, Math.min(20, r.h * 0.45)) + "px";
+  if (titleEl) {
+    const t = titleEl.style;
+    t.left = r.x + "px";
+    t.top = r.y - TITLE.gap - titleH() + "px"; // bottom of the title = TITLE.gap above the input
+    t.fontFamily = TITLE.font;
+    t.fontSize = TITLE.size + "px";
+    t.fontWeight = TITLE.weight;
+    t.color = TITLE.color;
+    t.lineHeight = TITLE.lineHeight;
+  }
+  // (iOS Safari zooms the page when an input's font is under 16px, so 16 is the minimum)
+  s.fontSize = Math.max(16, Math.min(20, r.h * 0.45)) + "px";
+  if (seasonBtn) {
+    // calendar icon: right next to the input, same height
+    const sz = r.h,
+      x = r.x + r.w + 8,
+      ss = seasonBtn.style,
+      ps = seasonPop.style;
+    ss.left = x + "px";
+    ss.top = r.y + "px";
+    ss.width = sz + "px";
+    ss.height = sz + "px";
+    ps.left = Math.max(8, x + sz - 64) + "px";
+    ps.top = r.y + sz + 6 + "px"; // season picker under the icon
+  }
   if (resetBtn) {
     const b = L.btn,
       bs = resetBtn.style;
-    bs.left = b.x + "px";
-    bs.top = b.y + "px";
+    // Pinned to the browser window with CSS (not to the canvas / design coordinates), so it stays put on resize.
+    bs.left = "auto";
+    bs.top = "auto";
+    bs.right = RESET_MARGIN + "px";
+    bs.bottom = RESET_MARGIN + "px";
     bs.width = b.w + "px";
     bs.height = b.h + "px";
     bs.fontSize = s.fontSize;
+    if (soundBtn) {
+      // sound toggle: just left of the reset button, same height / font
+      const ss2 = soundBtn.style;
+      ss2.left = "auto";
+      ss2.top = "auto";
+      ss2.right = RESET_MARGIN + b.w + 8 + "px";
+      ss2.bottom = RESET_MARGIN + "px";
+      ss2.width = Math.round(b.w * 1.35) + "px";
+      ss2.height = b.h + "px";
+      ss2.fontSize = s.fontSize;
+    }
   }
 }
 
@@ -271,6 +571,8 @@ function submitMemo() {
 function spawnFish(text) {
   const size = random(58, 96);
   const dir = random() < 0.5 ? -1 : 1;
+  const now = Date.now(); // the moment of creation: stored once, never recalculated
+  const season = preview.on ? preview.season : devSeason() || seasonOf(now); // picture only; createdAt stays real
   // Drop from the bottom-centre of the input box (converted to design space).
   const d = toDesign(L.input.x + L.input.w / 2, L.input.y + L.input.h);
   fishes.push(
@@ -290,9 +592,56 @@ function spawnFish(text) {
       y: d.y - 4,
       phase: random(TWO_PI),
       state: "dropping",
+      createdAt: now,
+      season,
     }),
   );
   saveState(); // important change: a new memo exists
+  if (preview.on) setPreview(false); // preview is one-shot: closes after a memo was really created
+}
+
+// Season from a timestamp (kept separate from the picture logic below).
+function seasonOf(ts) {
+  const m = new Date(ts).getMonth() + 1;
+  return m >= 3 && m <= 5
+    ? "spring"
+    : m >= 6 && m <= 8
+      ? "summer"
+      : m >= 9 && m <= 11
+        ? "autumn"
+        : "winter";
+}
+function devSeason() {
+  let q = null;
+  try {
+    q = new URLSearchParams(location.search).get("season");
+  } catch (e) {
+    /* ignore */
+  }
+  return SEASONS.includes(q)
+    ? q
+    : SEASONS.includes(DEV_SEASON)
+      ? DEV_SEASON
+      : null;
+}
+// "2026. 10. 06. 화 09:05" from the stored creation time ('' for old memos that have none).
+function formatStamp(ts) {
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const d = new Date(ts),
+    p = (n) => String(n).padStart(2, "0");
+  return (
+    d.getFullYear() +
+    ". " +
+    p(d.getMonth() + 1) +
+    ". " +
+    p(d.getDate()) +
+    ". " +
+    "일월화수목금토"[d.getDay()] +
+    " " +
+    p(d.getHours()) +
+    ":" +
+    p(d.getMinutes())
+  );
 }
 
 // Single place where a fish object is made (new memo or restored from storage).
@@ -306,6 +655,9 @@ function buildFish(o) {
     y: o.y,
     vy: 0,
     vx: 0,
+    createdAt:
+      Number.isFinite(o.createdAt) && o.createdAt > 0 ? o.createdAt : null, // null = old memo without a stamp
+    season: SEASONS.includes(o.season) ? o.season : null, // null = drawn (vector) fish
     dir: o.dir,
     speed: o.speed,
     size: o.size,
@@ -364,8 +716,16 @@ function saveState() {
           size: f.size,
           col: f.col.toString("#rrggbb"),
           phase: f.phase,
+          createdAt: f.createdAt,
+          season: f.season,
         })),
-        bookmarks: bookmarks.map((b) => ({ id: b.id, memo: b.memo, at: b.at })),
+        bookmarks: bookmarks.map((b) => ({
+          id: b.id,
+          memo: b.memo,
+          at: b.at,
+          createdAt: b.createdAt,
+          season: b.season,
+        })),
         bookmarkCount: bookmarks.length, // informational only; never trusted on load
       }),
     );
@@ -400,6 +760,11 @@ function loadState() {
           id: b.id,
           memo: b.memo,
           at: Number.isFinite(b.at) ? b.at : 0,
+          createdAt:
+            Number.isFinite(b.createdAt) && b.createdAt > 0
+              ? b.createdAt
+              : null, // old data: no stamp, none invented
+          season: SEASONS.includes(b.season) ? b.season : null,
         });
       }
     if (Array.isArray(d.fishes))
@@ -436,6 +801,8 @@ function loadState() {
               UW.r - size / 2,
             ),
             y: baseY,
+            createdAt: o.createdAt,
+            season: o.season,
             phase: Number.isFinite(o.phase) ? o.phase : random(TWO_PI),
             state: "swimming", // everything resumes swimming
           }),
@@ -473,7 +840,7 @@ function buildResetUI() {
   resetModal = document.createElement("div");
   resetModal.id = "reset-modal";
   resetModal.innerHTML =
-    '<div class="box" role="dialog" aria-modal="true"><div>모든 메모와 양동이에 저장된 메모를 영구적으로 삭제할까요? 이 작업은 되돌릴 수 없습니다.</div>' +
+    '<div class="box" role="dialog" aria-modal="true"><div>모든 메모와 양동이에 저장된 메모를 완전히 삭제할까요? 이 작업은 되돌릴 수 없습니다.</div>' +
     '<div class="row"><button type="button" id="reset-cancel">취소</button><button type="button" id="reset-confirm" class="danger">네, 초기화</button></div></div>';
   document.body.appendChild(resetModal);
 
@@ -510,8 +877,10 @@ function resetAll() {
   toast = null;
   panelCache = {};
   nextId = 1;
+  setPreview(false);
   bucketPour = null;
   bucketPress = null;
+  bucketAway = false;
   dumped = [];
   if (listOpen) closeList();
   bucket.x = BUCKET.mouthX;
@@ -639,7 +1008,8 @@ function wrapLines(text, n, limits) {
 
 // Text area inside a fish body is an ellipse (see fishShape); computed per fish from its size.
 function computeFishFit(f) {
-  const shape = { type: "ellipse", a: 0.27 * f.size, b: 0.12 * f.size };
+  const st = fishImg(f) ? fishImg(f).st : FISH_IMG_DEFAULT; // text area of the picture (or of the drawn fish)
+  const shape = { type: "ellipse", a: st.textA * f.size, b: st.textB * f.size };
   f.fit = fitText(f.memo, shape, shape.b * 2); // fs is in the fish's local units
   const sMax = Math.min(4.2, 270 / f.size);
   const s0 = Math.min(constrain(210 / f.size, 2, 3.4), sMax);
@@ -691,11 +1061,80 @@ function handPos() {
     y: SHOULDER.y + ARM_LEN * Math.sin(armPhi),
   };
 }
+// Arm pose: changes only when the pose name changes (an event), eases once, then stays exactly on the pose angle.
+let armPose = { goal: "idle", via: null, from: 0, to: 0, t: 1, ang: 0 };
+function startArmMove(to) {
+  armPose.from = armPose.ang;
+  armPose.to = FISHER.POSE[to];
+  armPose.t = 0;
+}
+function setArmPose(name) {
+  if (name === armPose.goal) return;
+  armPose.goal = name;
+  // catch -> feed first lowers the arm to the idle pose, then raises it to feed
+  if (name === "feed" && armPose.to === FISHER.POSE.catch) {
+    armPose.via = "feed";
+    startArmMove("idle");
+  } else {
+    armPose.via = null;
+    startArmMove(name);
+  }
+}
+function armPoseTarget() {
+  // derived from state, so it can only change when a state changes
+  if (throws.some((th) => !th.released)) return "feed";
+  if (
+    fishes.some(
+      (f) =>
+        f.state === "retrieving" ||
+        f.state === "caught" ||
+        f.state === "dragging",
+    )
+  )
+    return "catch";
+  return "idle";
+}
+function updateArmPose() {
+  setArmPose(armPoseTarget());
+  if (armPose.t < 1) {
+    armPose.t = Math.min(1, armPose.t + dt / FISHER.MOVE_S);
+    armPose.ang =
+      armPose.t >= 1
+        ? armPose.to
+        : lerp(armPose.from, armPose.to, easeInOut(armPose.t));
+    if (armPose.t >= 1 && armPose.via) {
+      const v = armPose.via;
+      armPose.via = null;
+      startArmMove(v);
+    } // second leg of catch -> idle -> feed
+  }
+}
+function armRot(p) {
+  // full-space point -> scene, rotated about the elbow by the current pose
+  const F = FISHER,
+    c = Math.cos(armPose.ang),
+    sn = Math.sin(armPose.ang);
+  const dx = p.x - F.ELBOW.x,
+    dy = p.y - F.ELBOW.y;
+  return fisherPt({
+    x: F.ELBOW.x + dx * c - dy * sn,
+    y: F.ELBOW.y + dx * sn + dy * c,
+  });
+}
+function fisherPt(p) {
+  const F = FISHER;
+  return {
+    x: F.DOCK_RIGHT + (p.x - F.ANCHOR.x) * F.SCALE,
+    y: DOCK_Y + (p.y - F.ANCHOR.y) * F.SCALE,
+  };
+} // full pixel space -> scene
 function rodBase() {
+  if (FISHER.ok) return armRot(FISHER.GRIP);
   const h = handPos();
   return { x: h.x - 6, y: h.y + 8 };
 }
 function rodTip() {
+  if (FISHER.ok) return armRot(FISHER.TIP); // the line starts here and follows every pose change
   const b = rodBase();
   return {
     x: b.x + ROD_LEN * Math.cos(rod.ang),
@@ -703,8 +1142,8 @@ function rodTip() {
   };
 }
 function hangAngle() {
-  return 14 * DEG + Math.sin(clock * 1.7) * 0.025;
-}
+  return 14 * DEG;
+} // tilt of a fish hanging from the hook (constant: nothing sways on its own)
 function sEff(f) {
   return Math.min(f.sCaught, Math.max(1.3, (690 - rodTip().x - 8) / f.size));
 }
@@ -760,7 +1199,8 @@ function draw() {
   splashes = splashes.filter((s) => s.t < 2.5);
 
   checkHold();
-  advanceThrows(); // advances throw clocks + arm swing
+  advanceThrows(); // advances throw clocks
+  if (FISHER.ok) updateArmPose();
   updateHook();
   updateBucket();
   updateDumped();
@@ -795,10 +1235,8 @@ function updateHook() {
     // The line length decides the hook's depth: target = tip + len. A damped spring (slightly
     // under-damped) eases the hook there, so it settles softly instead of snapping, and it
     // trails sideways a little while the line is being reeled.
-    const tx =
-      tip.x + constrain(-hook.vy * 0.02, -8, 8) + Math.sin(clock * 1.1) * 1.5;
-    const ty =
-      Math.min(tip.y + rod.len, UW.bottom - 6) + Math.sin(clock * 1.9) * 1.5;
+    const tx = tip.x + constrain(-hook.vy * 0.02, -8, 8);
+    const ty = Math.min(tip.y + rod.len, UW.bottom - 6);
     const K = 60,
       C = 12;
     hook.vx += (K * (tx - hook.x) - C * hook.vx) * dt;
@@ -814,8 +1252,8 @@ function updateHook() {
     hook.y = lerp(hook.startY, holdY, e);
   } else if (hook.mode === "hold") {
     const k = kk(10); // eases back to the rod tip (e.g. after a missed bucket drop)
-    hook.x += (tip.x + Math.sin(clock * 1.7) * 3 - hook.x) * k;
-    hook.y += (holdY + Math.sin(clock * 2.1) * 2 - hook.y) * k;
+    hook.x += (tip.x - hook.x) * k;
+    hook.y += (holdY - hook.y) * k;
   } else if (hook.mode === "drag") {
     // dragging a caught fish: the hook (and fish) follow the pointer
     const m = mouseD(),
@@ -868,8 +1306,24 @@ function hookFish(f) {
 function hangPose(f, theta, s, w) {
   f.faceX += (-1 - f.faceX) * kk(9); // turn to face left so it hangs from the mouth
   f.scale = s;
-  const tx = hook.x - (Math.cos(theta) * f.faceX * f.size * s) / 2;
-  const ty = hook.y - (Math.sin(theta) * f.faceX * f.size * s) / 2;
+  // The fish's mouth point (in the fish's local frame, mirrored by faceX) must sit on the hook tip.
+  let mx = (f.faceX * f.size) / 2,
+    my = 0;
+  const e = fishImg(f);
+  if (e) {
+    const st = e.st,
+      pw = f.size * st.width,
+      ph = (pw * e.img.height) / e.img.width;
+    mx =
+      -f.faceX *
+      ((st.mouthU - st.anchorX) * pw + st.offsetX * f.size) *
+      (st.facesRight ? -1 : 1);
+    my = (st.mouthV - st.anchorY) * ph + st.offsetY * f.size;
+  }
+  const c = Math.cos(theta),
+    sn = Math.sin(theta);
+  const tx = hook.x - s * (c * mx - sn * my);
+  const ty = hook.y - s * (sn * mx + c * my);
   if (w < 1) {
     // blend from where the fish was when it bit
     f.x = lerp(f.p0.x, tx, w);
@@ -909,6 +1363,7 @@ function updateFish(f) {
     f.textAlpha = 0;
     if (f.y > waveY(f.x)) {
       addSplash(f.x);
+      sfx("pop"); // sound A: new memo drops into the water
       f.vy *= 0.35;
       f.state = "swimming";
     }
@@ -947,6 +1402,9 @@ function updateFish(f) {
     if (f.vy > 0 && f.y > waveY(f.x) + 6) {
       // landed: swim away from the hook
       addSplash(f.x);
+      if (f.sfxRel === "pour")
+        sfx("splashPour", Math.random() * 0.04); // sound C: bucket released into the water (one per fish)
+      else sfx("splashOne"); // sound B: one fish released
       f.state = "swimming";
       f.dir = sg;
       f.vy *= 0.3;
@@ -967,6 +1425,8 @@ function updateFish(f) {
     if (f.hookedT >= 0.4) {
       f.state = "retrieving";
       f.retrieveT = 0;
+      sfx("reel"); // sound D1: reel ticks (a real catch only)
+      if (SND.ctx) SND.reelEnd = SND.ctx.currentTime + 0.6;
       hook.mode = "retrieve";
       hook.startX = hook.x;
       hook.startY = hook.y;
@@ -977,7 +1437,15 @@ function updateFish(f) {
     const e = easeInOut(f.retrieveT);
     hangPose(f, hangAngle() * e, lerp(1, sEff(f), smooth(0.1, 0.9, e)), 1);
     updateTextAlpha(f);
+    if (!f.sfxSurf && f.y < waveY(f.x) - 2) {
+      f.sfxSurf = true; // once per catch
+      sfxAfterReel("splashBig"); // sound D2: fish breaks the surface (after the reel ticks)
+    }
     if (f.retrieveT >= 1) {
+      if (!f.sfxSurf) {
+        f.sfxSurf = true;
+        sfxAfterReel("splashBig");
+      }
       f.state = "caught";
       hook.mode = "hold";
     }
@@ -1020,6 +1488,7 @@ function updateFish(f) {
 function releaseFish(f, landXOverride) {
   if (f.state !== "caught" && f.state !== "dragging") return;
   f.state = "released";
+  f.sfxRel = "one"; // sound B plays when it lands in the water
   f.textAlpha = 0; // memo disappears immediately
   const dir = f.x < 500 ? 1 : -1;
   const landX = constrain(
@@ -1052,7 +1521,7 @@ function startFishDrag(p) {
 function endFishDrag(f) {
   if (f.state !== "dragging") return;
   const m = mouseD(),
-    z = BUCKET.zone;
+    z = bucketZone();
   const inZone =
     m.x >= z.x && m.x <= z.x + z.w && m.y >= z.y && m.y <= z.y + z.h;
   if (!inZone) {
@@ -1063,13 +1532,22 @@ function endFishDrag(f) {
   if (bookmarks.length < MAX_BM) bookmarkFish(f);
   else {
     // full: nothing is lost, fish returns to the water
-    showToast("양동이가 가득 찼어요 (" + bookmarks.length + "/" + MAX_BM + ")");
+    showToast(
+      "양동이가 가득 찼어요 (" + bookmarks.length + "/" + MAX_BM + ")",
+      "panel",
+    );
     releaseFish(f, 330 + random(0, 120));
   }
 }
 
 function bookmarkFish(f) {
-  bookmarks.push({ id: f.id, memo: f.memo, at: Date.now() }); // the memo now lives in the bucket list
+  bookmarks.push({
+    id: f.id,
+    memo: f.memo,
+    at: Date.now(),
+    createdAt: f.createdAt,
+    season: f.season,
+  }); // the memo now lives in the bucket list
   f.state = "bucketed";
   f.bT = 0;
   f.b0 = { x: f.x, y: f.y, s: f.scale, r: f.rot };
@@ -1077,12 +1555,13 @@ function bookmarkFish(f) {
   hook.mode = "water";
   hook.lockUntil = millis() + 1200;
   bucketPulse = 1;
+  sfx("plopBucket", 0.25); // sound H: the fish drops into the bucket (when it reaches the mouth)
   saveState(); // fish is excluded (bucketed), bookmark list is saved
 }
 
-function showToast(msg) {
-  toast = { msg, t: 0 };
-}
+function showToast(msg, place) {
+  toast = { msg, t: 0, place: place || "bucket" };
+} // place: 'bucket' (default, near the bucket) | 'panel'
 
 /* ==========================================================================
    Interaction B: hold 2s -> throw to a bird
@@ -1123,10 +1602,11 @@ function armPhiAt(t) {
 }
 
 function advanceThrows() {
-  armPhi = PHI0; // the arm keeps its default pose (it only swings for the bird throw)
+  armPhi = PHI0; // drawn-person fallback only: the arm keeps its default pose (it only swings for the bird throw)
   for (const th of throws) {
     th.t += dt;
-    if (th.t < T_WIND + T_SWING + T_RECOVER) armPhi = armPhiAt(th.t);
+    if (!FISHER.ok && th.t < T_WIND + T_SWING + T_RECOVER)
+      armPhi = armPhiAt(th.t); // fallback only; the pictures use setArmPose()
     // Bird: flies in from the right toward the interception point, then carries the fish away.
     const b = th.bird;
     if (!th.carry) {
@@ -1162,6 +1642,7 @@ function updateThrowFish(th) {
     hangPose(f, hangAngle(), sEff(f), 1);
     if (th.t < tRel) return;
     th.released = true; // leaves the hook: line is free again
+    sfx("whoosh"); // sound E1: fish starts flying
     th.p0 = { x: f.x, y: f.y };
     th.v0 = {
       x: (th.I.x - f.x) / T_FLIGHT,
@@ -1199,6 +1680,202 @@ function updateThrowFish(th) {
 /* ==========================================================================
    Bucket: pictures, pose, memo list, drag + shake
    ========================================================================== */
+// Season fish pictures: loaded ONCE at start (not per fish). A missing / broken file only logs a warning and
+// those fish keep the drawn look.
+// 몸통 사진의 dock / 의자 크림색만 새 색으로 바꿉니다. [x0, y0, x1, y1]은 사진 안 픽셀 좌표예요.
+const FISHER_RECT = { dock: [0, 735, 1104, 857], stool: [510, 515, 800, 735] };
+// Why: reading pixels (loadPixels) from an image's canvas makes the browser switch THAT canvas to slow software mode
+// ("Multiple readback operations using getImageData ..."); drawing it every frame then re-uploads the whole picture to
+// the graphics card each time (30 fps lag with almost no JS time). A fresh copy that is never read back stays fast.
+function cleanCopy(img) {
+  try {
+    const c = createImage(img.width, img.height);
+    c.drawingContext.drawImage(img.canvas, 0, 0);
+    return c;
+  } catch (err) {
+    return img;
+  }
+}
+
+function recolorFisher(img) {
+  const CREAM = [244, 236, 223],
+    LINE = [14, 30, 11];
+  const d = [CREAM[0] - LINE[0], CREAM[1] - LINE[1], CREAM[2] - LINE[2]],
+    dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+  let loaded = false;
+  for (const key of ["dock", "stool"]) {
+    const hex = FISHER.COLOR[key];
+    if (!hex) continue;
+    if (!loaded) {
+      img.loadPixels();
+      loaded = true;
+    }
+    const c = color(hex),
+      T = [red(c), green(c), blue(c)],
+      [x0, y0, x1, y1] = FISHER_RECT[key];
+    for (let y = y0; y < Math.min(y1, img.height); y++)
+      for (let x = x0; x < Math.min(x1, img.width); x++) {
+        const i = 4 * (y * img.width + x);
+        if (img.pixels[i + 3] === 0) continue;
+        const r = img.pixels[i] - LINE[0],
+          g = img.pixels[i + 1] - LINE[1],
+          b = img.pixels[i + 2] - LINE[2];
+        const u = Math.min(
+          1,
+          Math.max(0, (r * d[0] + g * d[1] + b * d[2]) / dd),
+        );
+        const er = r - u * d[0],
+          eg = g - u * d[1],
+          eb = b - u * d[2];
+        if (u > 0.05 && Math.hypot(er, eg, eb) < 28)
+          for (let k = 0; k < 3; k++)
+            img.pixels[i + k] = LINE[k] + u * (T[k] - LINE[k]);
+      }
+  }
+  if (loaded) img.updatePixels();
+}
+
+function loadFisherImages() {
+  const F = FISHER;
+  loadImage(
+    F.BODY.file,
+    (a) =>
+      loadImage(
+        F.ARM.file,
+        (b) => {
+          recolorFisher(a);
+          F.img = cleanCopy(a);
+          F.armImg = b;
+          F.ok = true;
+          if (hook.mode === "water") {
+            const t = rodTip();
+            hook.x = t.x;
+            hook.y = t.y + rod.len;
+            hook.vx = hook.vy = 0;
+          } // line start moved with the new rod
+        },
+        () => console.warn("fisher arm image missing, using drawn person"),
+      ),
+    () => {
+      FISHER.failed = true;
+      console.warn("fisher body image missing, using drawn person");
+    },
+  );
+}
+
+// Finds the inside of an outline-only fish picture: closes small gaps in the line (dilate), floods the outside from
+// the picture border, and shrinks back. Returns a white silhouette image of the same size (null on failure).
+function makeFishFill(img) {
+  const w = img.width,
+    h = img.height,
+    R = Math.max(2, Math.round(w / 160));
+  img.loadPixels();
+  const grow = (src, r) => {
+    // square dilation (separable), out-of-picture counts as 0
+    const tmp = new Uint8Array(w * h),
+      out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let v = 0;
+        for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r) && !v; k++)
+          v = src[y * w + k];
+        tmp[y * w + x] = v;
+      }
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let v = 0;
+        for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r) && !v; k++)
+          v = tmp[k * w + x];
+        out[y * w + x] = v;
+      }
+    return out;
+  };
+  const ink = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) ink[i] = img.pixels[4 * i + 3] > 110 ? 1 : 0;
+  const dil = grow(ink, R),
+    outside = new Uint8Array(w * h),
+    stack = [];
+  const push2 = (i) => {
+    if (!dil[i] && !outside[i]) {
+      outside[i] = 1;
+      stack.push(i);
+    }
+  };
+  for (let x = 0; x < w; x++) {
+    push2(x);
+    push2((h - 1) * w + x);
+  }
+  for (let y = 0; y < h; y++) {
+    push2(y * w);
+    push2(y * w + w - 1);
+  }
+  while (stack.length) {
+    const i = stack.pop(),
+      x = i % w;
+    if (x > 0) push2(i - 1);
+    if (x < w - 1) push2(i + 1);
+    if (i >= w) push2(i - w);
+    if (i < w * (h - 1)) push2(i + w);
+  }
+  const notInner = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) notInner[i] = outside[i] ? 1 : 0;
+  const shrunk = grow(notInner, R); // 1 = still outside after shrinking the inside
+  const fill = createImage(w, h);
+  fill.loadPixels();
+  for (let i = 0; i < w * h; i++) {
+    const on = !shrunk[i];
+    fill.pixels[4 * i] = fill.pixels[4 * i + 1] = fill.pixels[4 * i + 2] = 255;
+    fill.pixels[4 * i + 3] = on ? 255 : 0;
+  }
+  fill.updatePixels();
+  return fill;
+}
+
+function loadFishImages() {
+  for (const key of SEASONS) {
+    const e = FISH_IMG[key];
+    e.ready = false;
+    e.st = Object.assign({}, FISH_IMG_DEFAULT, e); // per-season overrides win over the defaults
+    try {
+      loadImage(
+        encodeURI(e.file),
+        (img) => {
+          e.img = img;
+          e.textCol = null;
+          try {
+            e.fillImg = makeFishFill(img); // inside of the outline: filled with the fish colour when caught
+          } catch (err) {
+            e.fillImg = null;
+          }
+          try {
+            // average colour of the opaque pixels -> readable text colour
+            img.loadPixels();
+            let r = 0,
+              g = 0,
+              b = 0,
+              n = 0;
+            for (let i = 0; i < img.pixels.length; i += 16)
+              if (img.pixels[i + 3] > 200) {
+                r += img.pixels[i];
+                g += img.pixels[i + 1];
+                b += img.pixels[i + 2];
+                n++;
+              }
+            if (n) e.textCol = bestTextColor(color(r / n, g / n, b / n));
+          } catch (err) {
+            /* keep the fish's own text colour */
+          }
+          e.img = cleanCopy(img); // draw from a canvas that was never read back (see cleanCopy)
+          e.ready = true;
+        },
+        () => console.warn("fish image not found:", e.file),
+      );
+    } catch (err) {
+      console.warn(err);
+    }
+  }
+}
+
 // Pictures load asynchronously from setup(); if one fails, the drawn bucket is used instead.
 function loadBucketImages() {
   for (const key of Object.keys(BUCKET_IMG)) {
@@ -1259,7 +1936,7 @@ function prepareBucketImage(e, img) {
   } catch (err) {
     console.warn("could not process bucket image", err);
   }
-  e.img = img;
+  e.img = cleanCopy(img);
   e.m = m;
   e.ready = true;
 }
@@ -1295,10 +1972,17 @@ function bucketHit(m) {
 }
 
 function setUiLocked(b) {
+  if (titleEl) titleEl.style.visibility = b ? "hidden" : "visible"; // hidden while the memo list covers the page
   // memo input + reset button are off while the list is open
   inputEl.disabled = b;
   resetBtn.disabled = b;
-  inputEl.style.opacity = resetBtn.style.opacity = b ? "0.35" : "1";
+  seasonBtn.disabled = b;
+  seasonBtn.style.visibility = seasonPop.style.visibility = b
+    ? "hidden"
+    : "visible";
+  inputEl.style.visibility = resetBtn.style.visibility = b
+    ? "hidden"
+    : "visible"; // HTML elements sit above the canvas, so hide them
   if (b) inputEl.blur();
 }
 function openList() {
@@ -1372,6 +2056,7 @@ function updateBucket() {
       45 * DEG,
     );
     bucket.vrot = 0;
+    bucketAway = false; // dragging again: no sound until it is released and has returned
     detectShake(m.x);
   } else {
     // back to the dock / list position, upright (soft wobble)
@@ -1379,6 +2064,14 @@ function updateBucket() {
     bucket.y += (home.y - bucket.y) * kk(8);
     bucket.vrot += (90 * (0 - bucket.rot) - 10 * bucket.vrot) * dt;
     bucket.rot += bucket.vrot * dt;
+    if (
+      bucketAway &&
+      !listOpen &&
+      Math.hypot(home.x - bucket.x, home.y - bucket.y) < 4
+    ) {
+      bucketAway = false;
+      sfx("clang"); // sound G: back in place (plays once)
+    }
   }
 }
 
@@ -1409,6 +2102,7 @@ function triggerPour() {
   const items = bookmarks.slice();
   bookmarks = [];
   bucketPress = null; // list is emptied right away (count + picture update)
+  bucketAway = false;
   const queue = items.map((b, i) => {
     const size = random(58, 96);
     return {
@@ -1417,6 +2111,8 @@ function triggerPour() {
         // same id + memo text as the bookmark
         id: b.id,
         memo: b.memo,
+        createdAt: b.createdAt,
+        season: b.season,
         size,
         dir: random() < 0.5 ? -1 : 1,
         speed: random(18, 52),
@@ -1437,7 +2133,7 @@ function triggerPour() {
   showToast(
     water
       ? items.length + "개의 물고기를 놓아줬어요"
-      : items.length + "개의 메모를 삭제했어요",
+      : items.length + "개의 물고기를 삭제했어요",
   );
   saveState(); // land: gone for good. water: the queued fish are saved with the fish list.
 }
@@ -1457,11 +2153,12 @@ function emitPoured(P, f) {
     f.vx = P.dir * random(50, 150);
     f.vy = -random(20, 90);
     f.state = "released"; // existing physics: falls in, splashes, swims on, saves
+    f.sfxRel = "pour"; // sound C plays when it lands in the water
     f.noHookUntil = millis() + 4000;
     fishes.push(f);
   } else {
     f.scale = 0.55;
-    const floor = WATER_Y - 3 - f.size * 0.06,
+    const floor = DOCK_Y - 3 - f.size * 0.06,
       vy0 = -random(20, 80),
       H = Math.max(10, floor - my);
     const tf = (-vy0 + Math.sqrt(vy0 * vy0 + 2 * G_RELEASE * H)) / G_RELEASE;
@@ -1491,6 +2188,7 @@ function updateDumped() {
       if (d.vy > 0 && d.y >= d.floor) {
         d.y = d.floor;
         d.landed = true;
+        sfx("flop", Math.random() * 0.05); // sound F: flapping on the dock
         d.lt = 0;
         d.r0 = d.rot;
       }
@@ -1528,6 +2226,13 @@ function buildListLayout() {
     const lines = wrapLines(b.memo, 400, new Array(400).fill(colW - 28)) || [
       b.memo,
     ];
+    const stamp = formatStamp(b.createdAt); // "memo ---- 2026. 10. 26. 월 16:25" (old memos: text only)
+    if (stamp) {
+      const suffix = " ---- " + stamp,
+        last = lines.length - 1;
+      if (textWidth(lines[last] + suffix) <= colW - 28) lines[last] += suffix;
+      else lines.push("---- " + stamp);
+    }
     return { lines, h: lines.length * lh + padY * 2 };
   });
   listCache = {
@@ -1541,15 +2246,73 @@ function buildListLayout() {
   return listCache;
 }
 
+// px y of the top of the "n/10" label for a bucket whose base is at design y `by` with scale `sc`.
+// Drop zone in design units. Its top is computed from the same numbers drawBucket() uses for the "n/10" label
+// (base - bucketTopOffset(n) - label height), so the number is always inside the frame, whichever picture is shown.
+function bucketZone() {
+  const base = BUCKET.y + BUCKET.h,
+    cx = BUCKET.mouthX;
+  const top =
+    base -
+    bucketTopOffset(bookmarks.length) -
+    BUCKET_LABEL_FS * 1.15 -
+    ZONE_STYLE.padTop;
+  return {
+    x: cx - ZONE_STYLE.halfW,
+    y: top,
+    w: ZONE_STYLE.halfW * 2,
+    h: base + ZONE_STYLE.padBottom - top,
+  };
+}
+
+function bucketLabelTopPx(by, sc, n) {
+  return (
+    L.oy +
+    (by - bucketTopOffset(n) * sc) * L.u -
+    BUCKET_LABEL_FS * sc * L.u * 1.15
+  );
+}
+
+function listNoteMetrics() {
+  // font shrinks on narrow screens so the lines are never cut off
+  let fs = 15;
+  textSize(fs);
+  while (
+    fs > 10 &&
+    Math.max(...BUCKET_NOTE.map((t) => textWidth(t))) > width - 32
+  ) {
+    fs -= 1;
+    textSize(fs);
+  }
+  return { fs, lh: fs * 1.5, h: fs * 1.5 * BUCKET_NOTE.length };
+}
+
+function drawBucketNote() {
+  // only while the list is open
+  if (!listOpen) return;
+  const a = smooth(0.4, 1, listSlide),
+    mt = listNoteMetrics();
+  const bottom = bucketLabelTopPx(bucket.y, bucket.sc, bookmarks.length) - 8; // above n/10
+  noStroke();
+  fill(180, 180, 180, 255 * a);
+  textAlign(CENTER, BOTTOM);
+  textSize(mt.fs);
+  BUCKET_NOTE.forEach((ln, i) =>
+    text(ln, bucketCenterPx(), bottom - (BUCKET_NOTE.length - 1 - i) * mt.lh),
+  );
+}
+
 function drawListPanel() {
   const a = smooth(0, 0.6, listSlide);
   if (a <= 0.01) return;
-  const top = L.input.y + L.input.h + 12,
+  const top = 12,
     left = 12,
     w = width - 24,
-    h = height - top - 12;
+    h = height - 24; // thin frame 12px inside the window edge
   noStroke();
-  fill(31, 31, 31, 245 * a);
+  fill(31, 31, 31, 250 * a);
+  rect(0, 0, width, height); // covers the whole window (top to bottom)
+  noFill();
   stroke(220, 220, 220, 200 * a);
   strokeWeight(1.5);
   rect(left, top, w, h);
@@ -1559,7 +2322,7 @@ function drawListPanel() {
   const lp = listPose(),
     n = bookmarks.length;
   const bucketTopPx =
-    L.oy + lp.y * L.u - bucketTopOffset(n) * lp.sc * L.u - 22 * lp.sc; // incl. the n/10 label
+    bucketLabelTopPx(lp.y, lp.sc, n) - 8 - listNoteMetrics().h; // list ends above the n/10 label + the 2-line note
   const viewTop = top + 40,
     viewBottom = Math.max(viewTop + 40, bucketTopPx - 16),
     viewH = viewBottom - viewTop;
@@ -1568,7 +2331,7 @@ function drawListPanel() {
   noStroke();
   fill(119, 119, 119, 255 * a);
   textAlign(CENTER, TOP);
-  textSize(13);
+  textSize(16);
   text("양동이를 다시 누르면 닫혀요", cx, top + 14);
 
   const x1 = cx - lay.colW / 2,
@@ -1583,7 +2346,7 @@ function drawListPanel() {
     textSize(16);
     text("양동이가 비어 있어요", cx, (viewTop + viewBottom) / 2 - 12);
     fill(105, 105, 105, 255 * a);
-    textSize(13);
+    textSize(16);
     text(
       "낚은 물고기를 양동이로 끌어다 놓으면 메모가 보관돼요",
       cx,
@@ -1710,6 +2473,13 @@ function mouseReleased() {
   }
   if (bucketPress) {
     if (!bucketPress.dragging && !bucketPour) openList(); // plain click opens the list; a drag only moved the bucket
+    if (
+      bucketPress.dragging &&
+      !bucketPour &&
+      Math.hypot(bucket.x - BUCKET.mouthX, bucket.y - (BUCKET.y + BUCKET.h)) >
+        30
+    )
+      bucketAway = true; // sound G arms only if the bucket really has to come back
     bucketPress = null; // (the bucket springs back to the dock)
     return;
   }
@@ -1722,6 +2492,35 @@ function mouseReleased() {
     press = null; // (after a throw, nothing else happens)
   }
   drag = null;
+}
+
+/* ==========================================================================
+   Touch input (phones / tablets).
+   Phones only synthesize mouse events for a quick TAP (mousedown + mouseup together, after the finger lifts) and
+   never for dragging or holding, so mousePressed/mouseDragged/mouseReleased don't see those gestures.
+   These handlers forward real touch events to the same mouse functions, so one code path serves both.
+   Returning false stops the browser's scroll/zoom and its emulated mouse events (no double firing).
+   Touches that start on the input box or the reset button are left alone.
+   ========================================================================== */
+let touchActive = false;
+function touchStarted(e) {
+  if (!e || !e.target || e.target.tagName !== "CANVAS") return; // input / button: normal behaviour
+  if (touchActive || (e.touches && e.touches.length > 1)) return false; // ignore a second finger
+  touchActive = true;
+  mousePressed(e);
+  return false;
+}
+function touchMoved(e) {
+  if (!touchActive) return;
+  mouseDragged(e);
+  return false;
+}
+function touchEnded(e) {
+  if (!touchActive) return;
+  if (e && e.touches && e.touches.length > 0) return false; // another finger still down
+  touchActive = false;
+  mouseReleased(e);
+  return false;
 }
 
 function mouseWheel(e) {
@@ -1738,7 +2537,7 @@ function mouseWheel(e) {
    Rendering
    ========================================================================== */
 function render() {
-  background(COL.bg);
+  background(COL.sky); // everything above the water / dock bottom
 
   const m = mouseD();
   const overFish =
@@ -1761,6 +2560,8 @@ function render() {
   push();
   translate(L.ox, L.oy);
   scale(L.u);
+  drawBelowWater(); // dark area under the dock and the (wavy) water line
+  if (bucketPress && bucketPress.dragging && !listOpen) drawGuideLine(); // dock | water boundary, only while dragging
   drawPerson();
   for (const f of fishes) if (f.state === "bucketed") drawFish(f); // drawn behind the bucket: looks like it drops in
   if (listSlide <= 0.003) drawBucket(); // while the list is open the bucket is drawn above the panel instead
@@ -1793,10 +2594,36 @@ function render() {
     scale(L.u);
     drawBucket();
     pop();
+    drawBucketNote();
   }
 }
 
+function drawFisherImages() {
+  const F = FISHER,
+    k = F.SCALE;
+  push();
+  imageMode(CORNER);
+  const o = fisherPt(F.BODY);
+  image(F.img, o.x, o.y, F.img.width * k, F.img.height * k); // static body
+  const e = fisherPt(F.ELBOW);
+  translate(e.x, e.y);
+  rotate(armPose.ang); // forearm + hands + rod: one piece about the elbow
+  image(
+    F.armImg,
+    (F.ARM.x - F.ELBOW.x) * k,
+    (F.ARM.y - F.ELBOW.y) * k,
+    F.armImg.width * k,
+    F.armImg.height * k,
+  );
+  pop();
+}
+
 function drawPerson() {
+  if (FISHER.ok) {
+    drawFisherImages();
+    return;
+  }
+  if (!FISHER.failed) return; // 사진을 불러오는 중에는 아무것도 그리지 않음
   noStroke();
   fill(COL.dock);
   rect(35, 272, 242, 14); // dock
@@ -1820,15 +2647,49 @@ function drawPerson() {
 function drawRod() {
   const b = rodBase(),
     t = rodTip();
-  stroke(COL.rod);
-  strokeWeight(8);
-  strokeCap(SQUARE);
-  line(b.x, b.y, t.x, t.y);
-  strokeCap(ROUND);
+  if (!FISHER.ok && FISHER.failed) {
+    // drawn rod only when the pictures are missing
+    stroke(COL.rod);
+    strokeWeight(8);
+    strokeCap(SQUARE);
+    line(b.x, b.y, t.x, t.y);
+    strokeCap(ROUND);
+  }
   noFill();
   stroke(138, 138, 138, 130);
   strokeWeight(1.2);
   circle(t.x, t.y, 16); // drag handle hint at the tip
+}
+
+function drawGuideLine() {
+  push();
+  noFill();
+  stroke(GUIDE_LINE.color);
+  strokeWeight(GUIDE_LINE.weight);
+  strokeCap(SQUARE); // p5's SQUARE = butt caps: dash / gap lengths stay exact
+  drawingContext.setLineDash(GUIDE_LINE.dash);
+  line(WATER_X0, 0, WATER_X0, DH); // x of the real dock/water boundary, full scene height
+  drawingContext.setLineDash([]); // restore: every other line is solid again
+  pop();
+  strokeCap(ROUND);
+}
+
+// Dark ground colour below the dock's underside and the water surface, across the whole window width.
+function drawBelowWater() {
+  const x0 = -L.ox / L.u - 2,
+    x1 = (width - L.ox) / L.u + 2,
+    yb = (height - L.oy) / L.u + 2;
+  noStroke();
+  fill(COL.bg);
+  beginShape();
+  vertex(x0, yb);
+  vertex(x0, DOCK_Y + 14);
+  vertex(WATER_X0, DOCK_Y + 14);
+  for (let x = WATER_X0; x < WATER_X1; x += 4) vertex(x, waveY(x));
+  vertex(WATER_X1, waveY(WATER_X1));
+  vertex(x1, waveY(WATER_X1));
+  vertex(x1, yb);
+  endShape(CLOSE);
 }
 
 function drawWater() {
@@ -1838,7 +2699,8 @@ function drawWater() {
   strokeCap(ROUND);
   strokeJoin(ROUND);
   beginShape();
-  for (let x = 277; x <= 686; x += 4) vertex(x, waveY(x));
+  for (let x = WATER_X0; x < WATER_X1; x += 4) vertex(x, waveY(x));
+  vertex(WATER_X1, waveY(WATER_X1)); // end exactly at WATER_X1
   endShape();
 }
 
@@ -1850,7 +2712,7 @@ function drawLineAndHook() {
   strokeWeight(1.5);
   noFill();
   const sag = constrain(hook.vy * 0.03, -14, 14); // line bows while it is being reeled
-  const cx = lerp(t.x, hx, 0.4) + 6 + Math.sin(clock * 1.3) * 3 - sag,
+  const cx = lerp(t.x, hx, 0.4) + 6 - sag,
     cy = lerp(t.y, hy, 0.55);
   bezier(t.x, t.y, cx, cy, cx, cy, hx, hy - 10); // slightly bowed line
   strokeWeight(1.8); // small J-hook: the catch point is its tip
@@ -1894,8 +2756,41 @@ function fishShape(len) {
   endShape(CLOSE);
 }
 
+// Loaded picture entry for this fish's season, or null (not loaded / failed / old memo) -> the drawn fish is used.
+function fishImg(f) {
+  const e = f.season ? FISH_IMG[f.season] : null;
+  return e && e.ready ? e : null;
+}
+
+// The white inside-mask painted in one colour, as a small plain canvas (alpha of the mask is kept). Built ONCE per fish /
+// picture and then only drawn (cheap): painting a full-size mask every frame for every fish made the page lag.
+const FILL_MAXW = 512; // px width of the cached fill (enough for the biggest fish, even on a retina screen)
+function paintMask(mask, col) {
+  const k = Math.min(1, FILL_MAXW / mask.width),
+    w = Math.max(1, Math.round(mask.width * k)),
+    h = Math.max(1, Math.round(mask.height * k));
+  const cv = document.createElement("canvas");
+  cv.width = w;
+  cv.height = h;
+  const c = cv.getContext("2d");
+  c.drawImage(mask.canvas, 0, 0, w, h);
+  c.globalCompositeOperation = "source-in";
+  c.fillStyle =
+    "rgb(" +
+    Math.round(red(col)) +
+    "," +
+    Math.round(green(col)) +
+    "," +
+    Math.round(blue(col)) +
+    ")";
+  c.fillRect(0, 0, w, h);
+  return cv;
+}
+
 function drawFish(f) {
-  const len = f.size;
+  const len = f.size,
+    e = fishImg(f),
+    st = e ? e.st : FISH_IMG_DEFAULT;
   push();
   translate(f.x, f.y);
   rotate(f.rot);
@@ -1905,29 +2800,72 @@ function drawFish(f) {
   const fx =
     Math.abs(f.faceX) < 0.03 ? 0.03 * (Math.sign(f.faceX) || 1) : f.faceX;
   scale(fx, 1);
-  strokeWeight(2.2 / Math.sqrt(f.scale));
-  strokeJoin(ROUND);
-  stroke(lerpColor(f.col, color(255), f.fillAmt * 0.35));
-  if (f.fillAmt > 0.01)
-    fill(red(f.fillCol), green(f.fillCol), blue(f.fillCol), 255 * f.fillAmt);
-  else noFill();
-  fishShape(len);
-  noStroke();
-  fill(lerpColor(f.col, color(COL.bg), f.fillAmt));
-  circle(0.34 * len, -0.04 * len, len * 0.045); // eye
+  if (e) {
+    // season picture (transparent PNG), never stretched
+    if (!st.facesRight) scale(-1, 1);
+    const w = len * st.width,
+      h = (w * e.img.height) / e.img.width;
+    const wet = f.state === "swimming"; // 물속에서 헤엄치는 중: 안쪽을 물색으로 채워 겹친 물고기를 가림
+    if (e.fillImg && (wet || f.fillAmt > 0.01)) {
+      // inside of the outline. NOTE: p5's tint() re-computes every pixel on every call (very slow, it made the page lag),
+      // so the colour is painted with the plain canvas instead.
+      const ctx = drawingContext,
+        a0 = ctx.globalAlpha,
+        dx = -st.anchorX * w + st.offsetX * len,
+        dy = -st.anchorY * h + st.offsetY * len;
+      if (wet) {
+        // water-coloured copy, built once per picture
+        if (!e.fillWet) e.fillWet = paintMask(e.fillImg, color(COL.bg));
+        ctx.drawImage(e.fillWet, dx, dy, w, h);
+      } else {
+        // fish colour, fading in with fillAmt (painted once per fish)
+        if (!f.fillCv || f.fillCvFor !== e) {
+          f.fillCv = paintMask(e.fillImg, f.fillCol);
+          f.fillCvFor = e;
+        }
+        ctx.globalAlpha = a0 * f.fillAmt;
+        ctx.drawImage(f.fillCv, dx, dy, w, h);
+        ctx.globalAlpha = a0;
+      }
+    }
+    image(
+      e.img,
+      -st.anchorX * w + st.offsetX * len,
+      -st.anchorY * h + st.offsetY * len,
+      w,
+      h,
+    );
+  } else {
+    // fallback: the original drawn fish
+    strokeWeight(2.2 / Math.sqrt(f.scale));
+    strokeJoin(ROUND);
+    stroke(lerpColor(f.col, color(255), f.fillAmt * 0.35));
+    if (f.fillAmt > 0.01)
+      fill(red(f.fillCol), green(f.fillCol), blue(f.fillCol), 255 * f.fillAmt);
+    else noFill();
+    fishShape(len);
+    noStroke();
+    fill(lerpColor(f.col, color(COL.bg), f.fillAmt));
+    circle(0.34 * len, -0.04 * len, len * 0.045); // eye
+  }
   pop();
 
   // Memo text inside the body: only when caught and out of the water.
   if (f.textAlpha > 0.01 && f.fit) {
+    const tc = e && e.textCol && !e.fillImg ? e.textCol : f.textCol; // picture: colour chosen for contrast with its average colour
     noStroke();
-    fill(red(f.textCol), green(f.textCol), blue(f.textCol), 255 * f.textAlpha);
-    textAlign(CENTER, CENTER);
+    fill(255, 255, 255, 255 * f.textAlpha); // 항상 흰색
+    textAlign(CENTER, BASELINE); // 기준선 정렬: 브라우저 글꼴 정보와 상관없이 위치가 정확함
     textSize(f.fit.fs);
-    const cx = f.faceX * 0.075 * len,
-      cy = 0.005 * len,
+    const cx = f.faceX * st.textX * len,
+      cy = st.textY * len,
       n = f.fit.lines.length;
     for (let i = 0; i < n; i++)
-      text(f.fit.lines[i], cx, cy - (n * f.fit.lh) / 2 + (i + 0.5) * f.fit.lh);
+      text(
+        f.fit.lines[i],
+        cx,
+        cy - (n * f.fit.lh) / 2 + (i + 0.5) * f.fit.lh + f.fit.fs * 0.36,
+      );
   }
   pop();
 }
@@ -1986,7 +2924,7 @@ function drawMemoPanel() {
     panelCache[key] = fit;
   }
   noStroke();
-  fill(244, 244, 244, 255 * f.textAlpha);
+  fill(30, 58, 95, 255 * f.textAlpha);
   textSize(fit.fs);
   textAlign(L.narrow ? CENTER : LEFT, CENTER);
   const n = fit.lines.length,
@@ -1995,6 +2933,8 @@ function drawMemoPanel() {
   for (let i = 0; i < n; i++) text(fit.lines[i], x, y0 + (i + 0.5) * fit.lh);
 }
 
+// Hint text is centred on the window and vertically centred with the reset button (bottom-right).
+// It shrinks / wraps (max 3 lines) to the space left of the button, so it is never hidden behind the button or cut off.
 function drawHint() {
   if (listSlide > 0.003) return;
   let msg;
@@ -2009,12 +2949,28 @@ function drawHint() {
   else if (!activeFish)
     msg = "낚싯대를 위아래로 드래그해 낚싯줄 길이를 조절하세요.";
   else return;
+  // Centred on the window; the reset button stays at the bottom-right corner. The text may extend
+  // symmetrically from the window centre only as far as the button's left edge (minus a 12px gap).
+  const cx = width / 2,
+    aw = 2 * (L.btn.x - 12 - cx);
+  if (aw < 60) return;
+  let fs = 16,
+    lines = null;
+  for (; fs >= 11 && !lines; fs--) {
+    textSize(fs);
+    lines = wrapLines(msg, 3, [aw, aw, aw]);
+  }
+  if (!lines) {
+    fs = 11;
+    textSize(fs);
+    lines = [msg];
+  }
+  const lh = fs * 1.4,
+    cy = L.btn.y + L.btn.h / 2;
   noStroke();
-  fill(119);
-  textSize(14);
-  textAlign(CENTER, BOTTOM);
-  const w = L.narrow ? width - 32 : L.sceneW - 32;
-  text(msg, 16, height - 62, w, 46);
+  fill(220);
+  textAlign(CENTER, TOP);
+  lines.forEach((ln, i) => text(ln, cx, cy - (lines.length * lh) / 2 + i * lh));
 }
 
 function toPx(dx, dy) {
@@ -2049,33 +3005,513 @@ function drawBucket() {
   }
   pop();
   noStroke();
-  fill(n >= MAX_BM ? "#E8D95A" : "#DCDCDC");
+  fill(n >= MAX_BM ? "#b9b05c" : "#6e6d6d");
   textAlign(CENTER, BOTTOM);
-  textSize(13 * bucket.sc);
+  textSize(BUCKET_LABEL_FS * bucket.sc);
   text(n + "/" + MAX_BM, bucket.x, bucket.y - bucketTopOffset(n) * bucket.sc); // label above, never on the picture
   if (activeFish && activeFish.state === "dragging") {
-    const z = B.zone,
+    const z = bucketZone(),
       m = mouseD();
     const inside =
       m.x >= z.x && m.x <= z.x + z.w && m.y >= z.y && m.y <= z.y + z.h;
+    push(); // keep the dash / stroke state local to this frame
     drawingContext.setLineDash([6, 5]);
     noFill();
     stroke(204, 196, 68, inside ? 255 : 140);
     strokeWeight(1.5);
     rect(z.x, z.y, z.w, z.h, 6);
     drawingContext.setLineDash([]);
+    pop();
   }
+}
+
+// Where the 'panel' toast is centred (px): the middle of the memo-text area — landscape: right of the scene,
+// portrait: below the scene. That area is empty while a fish is being dropped into the bucket.
+function toastAnchor() {
+  const P = L.panel;
+  return {
+    x: P.x + P.w / 2,
+    y: P.y + P.h * 0.5,
+    maxW: Math.min(P.w, TOAST_STYLE.maxW),
+  };
 }
 
 function drawToast() {
   // short feedback, e.g. when the bucket is full
   if (!toast) return;
   const a = constrain((2.4 - toast.t) / 0.6, 0, 1);
-  const p = toPx(BUCKET.x, BUCKET.y - 38);
-  textSize(14);
-  textAlign(LEFT, BOTTOM);
-  const x = constrain(p.x, 8, Math.max(8, width - textWidth(toast.msg) - 8));
+  if (toast.place === "panel") {
+    // dark plate + yellow text: readable on any background
+    const A = toastAnchor(),
+      S = TOAST_STYLE,
+      lh = S.size * 1.4;
+    textSize(S.size);
+    const lines = wrapLines(
+      toast.msg,
+      6,
+      new Array(6).fill(A.maxW - S.pad * 2),
+    ) || [toast.msg];
+    const bw = Math.max(...lines.map((l) => textWidth(l))) + S.pad * 2,
+      bh = lines.length * lh + S.pad * 2;
+    const bx = constrain(A.x - bw / 2, 8, Math.max(8, width - bw - 8));
+    const by = constrain(A.y - bh / 2, 8, Math.max(8, height - bh - 8));
+    fill(255, 255, 255, 235 * a);
+    stroke(232, 217, 90, 255 * a);
+    strokeWeight(1.5);
+    rect(bx, by, bw, bh);
+    noStroke();
+    fill(232, 217, 90, 255 * a);
+    textAlign(CENTER, TOP);
+    lines.forEach((l, i) => text(l, bx + bw / 2, by + S.pad + i * lh));
+    return;
+  }
+  // Pour / release messages: centred over the water, just above the wave crests (never touching the line).
+  const p = toPx((WATER_X0 + WATER_X1) / 2, WATER_Y - TOAST_WATER_GAP);
+  textSize(16);
+  textAlign(CENTER, BOTTOM);
+  const hw = textWidth(toast.msg) / 2;
+  const x = constrain(p.x, 8 + hw, Math.max(8 + hw, width - 8 - hw));
   noStroke();
-  fill(232, 217, 90, 255 * a);
+  fill(161, 148, 42, 255 * a);
   text(toast.msg, x, p.y);
+}
+
+/* ==========================================================================
+   Sound (Web Audio). Everything is optional: if audio is unsupported, blocked, or a file is missing, the sketch
+   keeps working silently. Sounds are triggered ONLY from real events through sfx(name, delaySec) — never from draw().
+   - Background: a looping water recording from AUDIO_BG_FILES (put a real recording there; see the list below).
+   - Effects: short sounds synthesised with Web Audio (no files needed).
+   - Volumes are separate: SND.bgVol (background) and SND.sfxVol (effects). Start low / clear; adjust here.
+   ========================================================================== */
+const AUDIO_BG_FILES = [
+  "assets/audio/river.mp3",
+  "assets/river.mp3",
+  "river.mp3",
+  "assets/audio/river.ogg",
+  "assets/audio/river.wav",
+  "assets/river.wav",
+  "assets/river.ogg",
+]; // first one that loads is used
+const SND = {
+  ctx: null, // created on the first user gesture (browser autoplay rule)
+  bgVol: 0.22, // background loop volume (0..1)  — keep clearly below the effects
+  sfxVol: 1.8, // effects volume (0..1)
+  muted: false,
+  ready: false,
+  bgBuf: null,
+  bgNext: 0,
+  recent: [], // start times of recent effects (limits pile-ups)
+  last: {}, // last start time per effect name (limits double triggers)
+  reelEnd: 0, // ctx time when the reel ticks end (the big splash waits for it)
+};
+try {
+  SND.muted = localStorage.getItem("fishSoundMuted") === "1"; // (key does not start with "fishingMemo": reset keeps it)
+} catch (e) {}
+
+function initAudio() {
+  // call from a user gesture; safe to call repeatedly
+  try {
+    if (SND.ctx) {
+      if (SND.ctx.state === "suspended") SND.ctx.resume();
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const ctx = (SND.ctx = new AC());
+    SND.master = ctx.createGain();
+    SND.master.gain.value = SND.muted ? 0 : 1;
+    SND.master.connect(ctx.destination);
+    SND.bg = ctx.createGain();
+    SND.bg.gain.value = SND.bgVol;
+    SND.bg.connect(SND.master);
+    const comp = ctx.createDynamicsCompressor(); // keeps many overlapping effects from clipping
+    comp.threshold.value = -16;
+    comp.ratio.value = 6;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.2;
+    comp.connect(SND.master);
+    SND.sfx = ctx.createGain();
+    SND.sfx.gain.value = SND.sfxVol;
+    SND.sfx.connect(comp);
+    // short noise buffer + a small reverb tail (generated, no files)
+    const n = ctx.sampleRate * 2,
+      nb = ctx.createBuffer(1, n, ctx.sampleRate),
+      nd = nb.getChannelData(0);
+    for (let i = 0; i < n; i++) nd[i] = Math.random() * 2 - 1;
+    SND.noise = nb;
+    const rl = Math.floor(ctx.sampleRate * 1.4),
+      ir = ctx.createBuffer(2, rl, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = ir.getChannelData(c);
+      for (let i = 0; i < rl; i++)
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / rl, 2.6);
+    }
+    SND.rev = ctx.createConvolver();
+    SND.rev.buffer = ir;
+    SND.rev.connect(SND.sfx);
+    SND.ready = true;
+    if (ctx.state === "suspended") ctx.resume();
+    loadBackground();
+    loadClank();
+  } catch (e) {
+    console.warn("audio unavailable", e);
+    SND.ready = false;
+  }
+}
+
+// G: the bucket sound is a recording (assets/audio/bucket_clank.wav); if it is missing, the synthesised version below is used.
+const AUDIO_CLANK_FILES = [
+  "assets/audio/bucket_clank.wav",
+  "assets/bucket_clank.wav",
+  "bucket_clank.wav",
+];
+async function loadClank() {
+  for (const url of AUDIO_CLANK_FILES) {
+    try {
+      const r = await fetch(encodeURI(url));
+      if (!r.ok) continue;
+      SND.clankBuf = await SND.ctx.decodeAudioData(await r.arrayBuffer());
+      console.log("bucket sound loaded:", url);
+      return;
+    } catch (e) {
+      /* next path */
+    }
+  }
+  console.warn(
+    "bucket sound file not found (" +
+      AUDIO_CLANK_FILES.join(", ") +
+      ") - using the synthesised one",
+  );
+}
+
+// Loads the first existing file of AUDIO_BG_FILES; a missing file only logs a warning.
+async function loadBackground() {
+  for (const url of AUDIO_BG_FILES) {
+    try {
+      const r = await fetch(encodeURI(url));
+      if (!r.ok) continue;
+      const buf = await SND.ctx.decodeAudioData(await r.arrayBuffer());
+      console.log("background sound loaded:", url);
+      SND.bgBuf = buf;
+      SND.bgNext = SND.ctx.currentTime + 0.05;
+      scheduleBackground(true);
+      setInterval(() => scheduleBackground(false), 500);
+      return;
+    } catch (e) {
+      /* try the next file */
+    }
+  }
+  console.warn(
+    "background sound: no file found (" +
+      AUDIO_BG_FILES.join(", ") +
+      ") - effects still work",
+  );
+}
+
+// Seamless loop: each pass fades out while the next one (same recording) fades in (equal-power crossfade).
+function scheduleBackground(first) {
+  const ctx = SND.ctx,
+    b = SND.bgBuf;
+  if (!ctx || !b) return;
+  const xf = Math.min(3, b.duration / 4);
+  while (SND.bgNext - ctx.currentTime < 2) {
+    const t = SND.bgNext,
+      src = ctx.createBufferSource(),
+      g = ctx.createGain();
+    const fin = first && t === SND.bgNext && !SND.bgStarted ? 1.5 : xf;
+    SND.bgStarted = true;
+    const N = 32,
+      up = new Float32Array(N),
+      dn = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      up[i] = Math.sin((i / (N - 1)) * Math.PI * 0.5);
+      dn[i] = Math.cos((i / (N - 1)) * Math.PI * 0.5);
+    }
+    g.gain.setValueAtTime(0, t);
+    g.gain.setValueCurveAtTime(up, t, fin);
+    g.gain.setValueAtTime(1, t + fin);
+    g.gain.setValueAtTime(1, t + b.duration - xf);
+    g.gain.setValueCurveAtTime(dn, t + b.duration - xf, xf);
+    src.buffer = b;
+    src.connect(g);
+    g.connect(SND.bg);
+    src.start(t);
+    src.stop(t + b.duration + 0.1);
+    SND.bgNext = t + b.duration - xf;
+  }
+}
+
+function setMuted(m) {
+  SND.muted = m;
+  try {
+    localStorage.setItem("fishSoundMuted", m ? "1" : "0");
+  } catch (e) {}
+  if (SND.master)
+    SND.master.gain.setTargetAtTime(m ? 0 : 1, SND.ctx.currentTime, 0.05);
+  if (soundBtn) soundBtn.textContent = m ? "소리 OFF" : "소리 ON";
+}
+
+let soundBtn;
+function buildSoundUI() {
+  const st = document.createElement("style");
+  st.textContent =
+    "#sound-btn{position:fixed;box-sizing:border-box;background:transparent;color:#F4F4F4;border:1.5px solid #DCDCDC;border-radius:0;font-family:sans-serif;cursor:pointer;z-index:10;padding:0 8px;white-space:nowrap}" +
+    "#sound-btn:hover{background:#2C2C2C}";
+  document.head.appendChild(st);
+  soundBtn = document.createElement("button");
+  soundBtn.id = "sound-btn";
+  soundBtn.type = "button";
+  soundBtn.textContent = SND.muted ? "소리 OFF" : "소리 ON";
+  soundBtn.addEventListener("click", () => {
+    initAudio();
+    setMuted(!SND.muted);
+    soundBtn.blur();
+  });
+  document.body.appendChild(soundBtn);
+  // the first click / key / touch anywhere starts the audio (autoplay rule)
+  const first = () => {
+    initAudio();
+    for (const ev of ["pointerdown", "keydown", "touchstart"])
+      window.removeEventListener(ev, first, true);
+  };
+  for (const ev of ["pointerdown", "keydown", "touchstart"])
+    window.addEventListener(ev, first, true);
+}
+
+/* ---------- synthesis helpers ---------- */
+function sOut(node, wet) {
+  node.connect(SND.sfx);
+  if (wet > 0) {
+    const s = SND.ctx.createGain();
+    s.gain.value = wet;
+    node.connect(s);
+    s.connect(SND.rev);
+  }
+}
+function sEnv(g, t, att, peak, dec) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0002), t + att);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + att + dec);
+}
+function sTone(t, f0, f1, dur, peak, type, wet) {
+  const c = SND.ctx,
+    o = c.createOscillator(),
+    g = c.createGain();
+  o.type = type || "sine";
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  sEnv(g, t, Math.min(0.006, dur / 3), peak, dur);
+  o.connect(g);
+  sOut(g, wet || 0);
+  o.start(t);
+  o.stop(t + dur + 0.05);
+}
+function sNoise(t, dur, ftype, f0, f1, q, peak, att, wet) {
+  const c = SND.ctx,
+    s = c.createBufferSource(),
+    f = c.createBiquadFilter(),
+    g = c.createGain();
+  s.buffer = SND.noise;
+  f.type = ftype;
+  f.Q.value = q;
+  f.frequency.setValueAtTime(f0, t);
+  f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  sEnv(g, t, att || 0.005, peak, dur);
+  s.connect(f);
+  f.connect(g);
+  sOut(g, wet || 0);
+  s.start(t, Math.random() * 1.5);
+  s.stop(t + dur + (att || 0.005) + 0.05);
+}
+const rnd = (a, b) => a + Math.random() * (b - a);
+
+const SFX = {
+  // A: new memo drops into the water — small, bright "pop"
+  pop(t) {
+    const r = rnd(0.94, 1.08);
+    sTone(t, 520 * r, 1150 * r, 0.11, 0.38, "sine", 0.18);
+    sTone(t + 0.07, 800 * r, 1500 * r, 0.07, 0.12, "sine", 0.18);
+    sNoise(t, 0.03, "highpass", 3500, 3500, 0.7, 0.06, 0.002, 0);
+  },
+  // H: fish goes into the bucket — lower, rounder "plop"
+  plopBucket(t) {
+    const r = rnd(0.95, 1.05);
+    sTone(t, 210 * r, 470 * r, 0.17, 0.55, "sine", 0.2);
+    sTone(t + 0.1, 340 * r, 260 * r, 0.12, 0.2, "sine", 0.2);
+    sNoise(t, 0.24, "lowpass", 900, 250, 0.7, 0.22, 0.004, 0.1);
+  },
+  // B: one released fish — a soft, low watery splash (muffled hiss + rising bubbles; no bright / crinkly noise)
+  splashOne(t, v) {
+    const r = rnd(0.92, 1.08);
+    sNoise(t, 0.32, "lowpass", 2400 * r, 800 * r, 0.5, 0.42 * v, 0.03, 0.08);
+    sNoise(
+      t + 0.02,
+      0.28,
+      "bandpass",
+      1300 * r,
+      650 * r,
+      0.9,
+      0.2 * v,
+      0.03,
+      0.08,
+    );
+    for (let i = 0; i < 5; i++) {
+      const f = rnd(350, 1000) * r;
+      sTone(
+        t + 0.04 + i * rnd(0.035, 0.06),
+        f,
+        f * rnd(1.7, 2.2),
+        rnd(0.06, 0.1),
+        0.16 * v,
+        "sine",
+        0.05,
+      );
+    }
+  },
+  // C: many fish poured into the water — a lighter splash per fish (kept cheap: few nodes, no reverb)
+  splashPour(t, v) {
+    const r = rnd(0.8, 1.25);
+    sNoise(
+      t,
+      rnd(0.2, 0.3),
+      "bandpass",
+      4000 * r,
+      1700 * r,
+      0.7,
+      0.26 * v,
+      0.008,
+      0,
+    );
+    for (let i = 0; i < 2; i++) {
+      const f = rnd(700, 1800) * r;
+      sTone(t + 0.04 + i * 0.04, f, f * 1.7, 0.05, 0.07 * v, "sine", 0);
+    }
+  },
+  // D1: reel — quick light ratchet
+  reel(t) {
+    for (let i = 0; i < 14; i++) {
+      const tt = t + i * 0.04;
+      sNoise(tt, 0.014, "highpass", 3000, 3000, 1, 0.14 + i * 0.004, 0.001, 0);
+      sTone(tt, 1500, 1150, 0.012, 0.035, "square", 0);
+    }
+  },
+  // D2: fish breaks the surface — the same soft splash as B, a little bigger and longer
+  splashBig(t) {
+    const r = rnd(0.95, 1.05);
+    sNoise(t, 0.45, "lowpass", 2600 * r, 750 * r, 0.5, 0.5, 0.04, 0.08);
+    sNoise(
+      t + 0.08,
+      0.38,
+      "bandpass",
+      1400 * r,
+      600 * r,
+      0.9,
+      0.24,
+      0.05,
+      0.08,
+    );
+    for (let i = 0; i < 7; i++) {
+      const f = rnd(350, 1100) * r;
+      sTone(
+        t + 0.05 + i * rnd(0.035, 0.065),
+        f,
+        f * rnd(1.7, 2.2),
+        rnd(0.06, 0.11),
+        0.17,
+        "sine",
+        0.06,
+      );
+    }
+  },
+  // E1: fish leaves the hook — whoosh
+  whoosh(t) {
+    sNoise(t, 0.4, "bandpass", 450, 2600, 1.1, 0.38, 0.12, 0.08);
+  },
+  // F: fish lands on the dock — flapping on a hard floor (no water sounds; light on purpose: it can come in groups)
+  flop(t, v) {
+    const times = [0, 0.12, 0.26, 0.4, 0.58];
+    times.forEach((d, i) => {
+      const tt = t + d + rnd(-0.012, 0.012),
+        a = Math.pow(0.78, i) * v;
+      sNoise(tt, 0.045, "lowpass", 900, 350, 0.8, 0.4 * a, 0.002, 0);
+      sTone(tt, 170 * rnd(0.9, 1.15), 80, 0.05, 0.3 * a, "sine", 0);
+    });
+  },
+  // G: empty metal bucket settles back — "ding" then a few quick rattles ("땡그랑") with a ringing tail
+  clang(t) {
+    if (SND.clankBuf) {
+      const src = SND.ctx.createBufferSource(),
+        g = SND.ctx.createGain();
+      src.buffer = SND.clankBuf;
+      g.gain.value = 0.45; // the recording is loud (peak 0 dB)
+      src.connect(g);
+      sOut(g, 0);
+      src.start(t);
+      return;
+    }
+    const hits = [
+      [0, 1, 1.0],
+      [0.1, 0.78, 0.6],
+      [0.19, 1.12, 0.42],
+      [0.27, 0.9, 0.28],
+    ];
+    const P = [
+      [1, 0.5, 1.1],
+      [2.32, 0.35, 0.7],
+      [4.25, 0.22, 0.4],
+      [6.63, 0.12, 0.25],
+    ];
+    for (const [dt0, pm, a] of hits) {
+      const f0 = 560 * pm;
+      for (const [m, pa, d] of P)
+        sTone(
+          t + dt0,
+          f0 * m,
+          f0 * m * 0.997,
+          d * (a > 0.5 ? 1.3 : 0.8),
+          pa * a * 0.35,
+          "sine",
+          0.4,
+        );
+      sNoise(t + dt0, 0.03, "bandpass", 3500, 3500, 1.2, 0.25 * a, 0.001, 0.3);
+    }
+  },
+};
+const SFX_GAP = {
+  pop: 0.08,
+  plopBucket: 0.08,
+  splashOne: 0.08,
+  reel: 0.2,
+  splashBig: 0.2,
+  whoosh: 0.2,
+  clang: 0.3,
+}; // min seconds between starts (no double triggers)
+const SFX_CROWD = { splashPour: 1, flop: 1 }; // sounds that may come in groups: quieter the more recent ones there are
+
+// Play an effect at an event. delay in seconds. Does nothing if audio is not ready / muted.
+function sfx(name, delay) {
+  try {
+    if (!SND.ready || SND.muted || !SFX[name]) return;
+    const c = SND.ctx,
+      now = c.currentTime;
+    if (c.state === "suspended") c.resume();
+    let v = 1;
+    if (SFX_CROWD[name]) {
+      SND.recent = SND.recent.filter((r) => now - r < 0.5);
+      v = 1 / (1 + 0.3 * SND.recent.length); // many at once: total loudness stays limited
+      if (SND.recent.length > 6) return; // enough voices: skip the rest (keeps the page smooth)
+      SND.recent.push(now);
+    } else {
+      if (now - (SND.last[name] || -9) < (SFX_GAP[name] || 0.08)) return;
+      SND.last[name] = now;
+    }
+    SFX[name](now + (delay || 0) + 0.005, v);
+  } catch (e) {
+    /* never let a sound break the sketch */
+  }
+}
+// D: the big splash must come AFTER the reel ticks: call at the moment the fish leaves the water.
+function sfxAfterReel(name) {
+  if (!SND.ready) return;
+  sfx(name, Math.max(0, SND.reelEnd - SND.ctx.currentTime));
 }
